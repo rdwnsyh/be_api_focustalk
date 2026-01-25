@@ -3,9 +3,10 @@ from pydantic import BaseModel, EmailStr
 from google.oauth2 import id_token
 from google.auth.transport import requests
 from passlib.context import CryptContext
-from sqlalchemy import create_engine, Column, Integer, String
+from sqlalchemy import create_engine, Column, Integer, String, DateTime
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
+from datetime import datetime
 import os
 
 # ===========================
@@ -43,6 +44,11 @@ class User(Base):
     password_hash = Column(String, nullable=True)  # Nullable for Google OAuth users
     google_id = Column(String, unique=True, nullable=True)  # For Google OAuth users
     picture = Column(String, nullable=True)
+    
+    # Leaderboard/Progress Fields
+    total_solved = Column(Integer, default=0, nullable=False)
+    current_streak = Column(Integer, default=0, nullable=False)
+    last_active = Column(DateTime, default=datetime.utcnow, nullable=False)
 
 # Create tables
 Base.metadata.create_all(bind=engine)
@@ -78,6 +84,17 @@ class UserResponse(BaseModel):
     name: str
     picture: str = None
     user_id: int
+
+class UserProgressUpdate(BaseModel):
+    email: EmailStr
+    solved_increment: int
+    streak: int
+
+class LeaderboardEntry(BaseModel):
+    name: str
+    picture: str = None
+    total_solved: int
+    current_streak: int
 
 # ===========================
 # FASTAPI APP
@@ -137,7 +154,10 @@ async def register(user_data: UserRegister, db: Session = Depends(get_db)):
         full_name=user_data.full_name,
         password_hash=hashed_password,
         google_id=None,
-        picture=None
+        picture=None,
+        total_solved=0,
+        current_streak=0,
+        last_active=datetime.utcnow()
     )
     
     db.add(new_user)
@@ -183,6 +203,10 @@ async def login(credentials: UserLogin, db: Session = Depends(get_db)):
             detail="Incorrect email or password"
         )
     
+    # Update last_active
+    user.last_active = datetime.utcnow()
+    db.commit()
+    
     # Return user info
     return {
         "success": True,
@@ -221,12 +245,13 @@ async def google_auth(request: GoogleSignInRequest, db: Session = Depends(get_db
         user = db.query(User).filter(User.email == email).first()
         
         if user:
-            # User exists, update Google ID if not set
+            # User exists, update Google ID if not set and update last_active
             if user.google_id is None:
                 user.google_id = google_user_id
                 user.picture = picture
-                db.commit()
-                db.refresh(user)
+            user.last_active = datetime.utcnow()
+            db.commit()
+            db.refresh(user)
         else:
             # Create new user
             user = User(
@@ -234,7 +259,10 @@ async def google_auth(request: GoogleSignInRequest, db: Session = Depends(get_db
                 full_name=name,
                 password_hash=None,  # Google users don't have password
                 google_id=google_user_id,
-                picture=picture
+                picture=picture,
+                total_solved=0,
+                current_streak=0,
+                last_active=datetime.utcnow()
             )
             db.add(user)
             db.commit()
@@ -287,7 +315,67 @@ async def get_current_user(token: str, db: Session = Depends(get_db)):
             "email": user.email,
             "name": user.full_name,
             "picture": user.picture,
-            "auth_method": "google" if user.google_id else "email"
+            "auth_method": "google" if user.google_id else "email",
+            "total_solved": user.total_solved,
+            "current_streak": user.current_streak
         }
     except ValueError:
         raise HTTPException(status_code=401, detail="Invalid token")
+
+# ===========================
+# PROGRESS & LEADERBOARD ENDPOINTS
+# ===========================
+
+@app.post("/user/sync_progress")
+async def sync_progress(progress: UserProgressUpdate, db: Session = Depends(get_db)):
+    """
+    Sync user's learning progress from the app
+    Updates total solved questions and streak
+    """
+    # Find user by email
+    user = db.query(User).filter(User.email == progress.email).first()
+    
+    if not user:
+        raise HTTPException(
+            status_code=404,
+            detail="User not found. Please login first."
+        )
+    
+    # Update user progress
+    user.total_solved += progress.solved_increment
+    user.current_streak = progress.streak
+    user.last_active = datetime.utcnow()
+    
+    db.commit()
+    db.refresh(user)
+    
+    return {
+        "success": True,
+        "message": "Progress synced successfully",
+        "total_solved": user.total_solved,
+        "current_streak": user.current_streak
+    }
+
+@app.get("/leaderboard")
+async def get_leaderboard(db: Session = Depends(get_db)):
+    """
+    Get top 20 users ranked by total solved questions
+    """
+    # Query users ordered by total_solved descending
+    top_users = db.query(User).order_by(User.total_solved.desc()).limit(20).all()
+    
+    # Format response
+    leaderboard = []
+    for rank, user in enumerate(top_users, start=1):
+        leaderboard.append({
+            "rank": rank,
+            "name": user.full_name,
+            "picture": user.picture,
+            "total_solved": user.total_solved,
+            "current_streak": user.current_streak
+        })
+    
+    return {
+        "success": True,
+        "leaderboard": leaderboard
+    }
