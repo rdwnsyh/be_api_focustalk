@@ -1,28 +1,43 @@
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException, Depends, Request
+from fastapi.responses import JSONResponse
+from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, EmailStr
 from google.oauth2 import id_token
 from google.auth.transport import requests
-from passlib.context import CryptContext
+import bcrypt
 from sqlalchemy import create_engine, Column, Integer, String, DateTime
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
 from datetime import datetime
 import os
+import traceback
 
 # ===========================
 # SECURITY SETUP
 # ===========================
 
-# Password hashing context
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-
 def get_password_hash(password: str) -> str:
     """Hash a password using bcrypt"""
-    return pwd_context.hash(password)
+    # Ensure password is encoded as bytes and truncate to 72 bytes if needed
+    password_bytes = password.encode('utf-8')
+    if len(password_bytes) > 72:
+        password_bytes = password_bytes[:72]
+    
+    # Generate salt and hash
+    salt = bcrypt.gensalt()
+    hashed = bcrypt.hashpw(password_bytes, salt)
+    return hashed.decode('utf-8')
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
     """Verify a password against its hash"""
-    return pwd_context.verify(plain_password, hashed_password)
+    # Ensure password is encoded as bytes and truncate to 72 bytes if needed
+    password_bytes = plain_password.encode('utf-8')
+    if len(password_bytes) > 72:
+        password_bytes = password_bytes[:72]
+    
+    # Hash must be in bytes
+    hashed_bytes = hashed_password.encode('utf-8')
+    return bcrypt.checkpw(password_bytes, hashed_bytes)
 
 # ===========================
 # DATABASE SETUP
@@ -102,6 +117,34 @@ class LeaderboardEntry(BaseModel):
 
 app = FastAPI(title="FocusTalk API", version="1.0.0")
 
+# Add exception handlers for better error responses
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    """Handle all unhandled exceptions"""
+    print(f"❌ Unhandled exception: {str(exc)}")
+    print(f"📋 Traceback: {traceback.format_exc()}")
+    return JSONResponse(
+        status_code=500,
+        content={
+            "success": False,
+            "error": "Internal server error",
+            "detail": str(exc),
+            "type": type(exc).__name__
+        }
+    )
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    """Handle validation errors"""
+    return JSONResponse(
+        status_code=422,
+        content={
+            "success": False,
+            "error": "Validation error",
+            "detail": exc.errors()
+        }
+    )
+
 # Google Client ID
 GOOGLE_CLIENT_ID = "383786989370-tegl1qqrjaj72u313k8tok1peojo9fao.apps.googleusercontent.com"
 
@@ -130,50 +173,75 @@ async def register(user_data: UserRegister, db: Session = Depends(get_db)):
     """
     Register a new user with email and password
     """
-    # Check if user already exists
-    existing_user = db.query(User).filter(User.email == user_data.email).first()
-    if existing_user:
-        raise HTTPException(
-            status_code=400,
-            detail="Email already registered. Please use a different email or login."
+    try:
+        print(f"📝 Attempting to register user: {user_data.email}")
+        
+        # Check if user already exists
+        existing_user = db.query(User).filter(User.email == user_data.email).first()
+        if existing_user:
+            raise HTTPException(
+                status_code=400,
+                detail="Email already registered. Please use a different email or login."
+            )
+        
+        # Validate password length (in bytes for bcrypt)
+        password_bytes = user_data.password.encode('utf-8')
+        if len(user_data.password) < 6:
+            raise HTTPException(
+                status_code=400,
+                detail="Password must be at least 6 characters long"
+            )
+        
+        if len(password_bytes) > 72:
+            raise HTTPException(
+                status_code=400,
+                detail="Password is too long (max 72 bytes). Please use a shorter password."
+            )
+        
+        print(f"🔐 Hashing password...")
+        # Hash the password
+        hashed_password = get_password_hash(user_data.password)
+        
+        print(f"👤 Creating new user in database...")
+        # Create new user
+        new_user = User(
+            email=user_data.email,
+            full_name=user_data.full_name,
+            password_hash=hashed_password,
+            google_id=None,
+            picture=None,
+            total_solved=0,
+            current_streak=0,
+            last_active=datetime.utcnow()
         )
+        
+        db.add(new_user)
+        db.commit()
+        db.refresh(new_user)
+        
+        print(f"✅ User registered successfully: {new_user.email}")
+        
+        # Return user info
+        return {
+            "success": True,
+            "token": f"focustalk_token_{new_user.id}",
+            "email": new_user.email,
+            "name": new_user.full_name,
+            "picture": new_user.picture,
+            "user_id": new_user.id,
+            "message": "Registration successful!"
+        }
     
-    # Validate password length
-    if len(user_data.password) < 6:
+    except HTTPException as he:
+        # Re-raise HTTP exceptions
+        raise he
+    except Exception as e:
+        print(f"❌ Registration error: {str(e)}")
+        print(f"📋 Traceback: {traceback.format_exc()}")
         raise HTTPException(
-            status_code=400,
-            detail="Password must be at least 6 characters long"
+            status_code=500,
+            detail=f"Registration failed: {str(e)}"
         )
-    
-    # Hash the password
-    hashed_password = get_password_hash(user_data.password)
-    
-    # Create new user
-    new_user = User(
-        email=user_data.email,
-        full_name=user_data.full_name,
-        password_hash=hashed_password,
-        google_id=None,
-        picture=None,
-        total_solved=0,
-        current_streak=0,
-        last_active=datetime.utcnow()
-    )
-    
-    db.add(new_user)
-    db.commit()
-    db.refresh(new_user)
-    
-    # Return user info
-    return {
-        "success": True,
-        "token": f"focustalk_token_{new_user.id}",  # In production, use proper JWT
-        "email": new_user.email,
-        "name": new_user.full_name,
-        "picture": new_user.picture,
-        "user_id": new_user.id,
-        "message": "Registration successful!"
-    }
 
 @app.post("/auth/login")
 async def login(credentials: UserLogin, db: Session = Depends(get_db)):
