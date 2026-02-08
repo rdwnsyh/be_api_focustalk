@@ -1,4 +1,5 @@
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException, Depends, Form, File, UploadFile
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, EmailStr
 from google.oauth2 import id_token
 from google.auth.transport import requests
@@ -9,6 +10,8 @@ from sqlalchemy.orm import sessionmaker, Session
 import os
 import time
 import logging
+import shutil
+from pathlib import Path
 
 # ===========================
 # LOGGING SETUP
@@ -63,6 +66,8 @@ class User(Base):
     password_hash = Column(String, nullable=True)  # Nullable for Google OAuth users
     google_id = Column(String, unique=True, nullable=True)  # For Google OAuth users
     picture = Column(String, nullable=True)
+    solved_count = Column(Integer, default=0, nullable=False)  # Track quiz progress
+    streak = Column(Integer, default=0, nullable=False)  # Track daily streak
 
 # Create tables
 Base.metadata.create_all(bind=engine)
@@ -99,14 +104,62 @@ class UserResponse(BaseModel):
     picture: str = None
     user_id: int
 
+class SyncProgressRequest(BaseModel):
+    email: EmailStr
+    solved_increment: int
+    streak: int
+
 # ===========================
 # FASTAPI APP
 # ===========================
 
 app = FastAPI(title="FocusTalk API", version="1.0.0")
 
-# Google Client ID
-GOOGLE_CLIENT_ID = "970950673922-5mecnlsjs82007ji8tp87ba9153tl22i.apps.googleusercontent.com"
+# Create static directory if it doesn't exist
+static_dir = Path("static")
+static_dir.mkdir(exist_ok=True)
+profile_images_dir = static_dir / "profile_images"
+profile_images_dir.mkdir(exist_ok=True)
+
+# Mount static files directory for profile images
+try:
+    app.mount("/static", StaticFiles(directory="static"), name="static")
+    logger.info("✅ Static files mounted successfully")
+except Exception as e:
+    logger.warning(f"⚠️ Could not mount static files: {e}")
+
+# Enable CORS for Flutter app
+from fastapi.middleware.cors import CORSMiddleware
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # In production, specify exact origins
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Google Client ID (Web Application)
+GOOGLE_CLIENT_ID = "383786989370-tegl1qqrjaj72u313k8tok1peojo9fao.apps.googleusercontent.com"
+
+# ===========================
+# HELPER FUNCTIONS
+# ===========================
+
+def get_full_image_url(picture_path: str, base_url: str = "http://192.168.1.10:8000") -> str:
+    """
+    Convert relative image path to full URL
+    If picture_path is already a full URL (starts with http), return as is
+    """
+    if not picture_path:
+        return None
+    
+    if picture_path.startswith('http://') or picture_path.startswith('https://'):
+        return picture_path
+    
+    # Remove leading slash if present
+    picture_path = picture_path.lstrip('/')
+    return f"{base_url}/{picture_path}"
 
 # ===========================
 # ENDPOINTS
@@ -176,7 +229,7 @@ async def register(user_data: UserRegister, db: Session = Depends(get_db)):
         "token": f"focustalk_token_{new_user.id}",  # In production, use proper JWT
         "email": new_user.email,
         "name": new_user.full_name,
-        "picture": new_user.picture,
+        "picture": get_full_image_url(new_user.picture),
         "user_id": new_user.id,
         "message": "Registration successful!"
     }
@@ -216,7 +269,7 @@ async def login(credentials: UserLogin, db: Session = Depends(get_db)):
         "token": f"focustalk_token_{user.id}",  # In production, use proper JWT
         "email": user.email,
         "name": user.full_name,
-        "picture": user.picture,
+        "picture": get_full_image_url(user.picture),
         "user_id": user.id,
         "message": "Login successful!"
     }
@@ -272,7 +325,7 @@ async def google_auth(request: GoogleSignInRequest, db: Session = Depends(get_db
             "token": f"focustalk_token_{user.id}",  # In production, use proper JWT
             "email": user.email,
             "name": user.full_name,
-            "picture": user.picture,
+            "picture": get_full_image_url(user.picture),
             "user_id": user.id
         }
         
@@ -313,8 +366,147 @@ async def get_current_user(token: str, db: Session = Depends(get_db)):
             "user_id": user.id,
             "email": user.email,
             "name": user.full_name,
-            "picture": user.picture,
+            "picture": get_full_image_url(user.picture),
             "auth_method": "google" if user.google_id else "email"
         }
     except ValueError:
         raise HTTPException(status_code=401, detail="Invalid token")
+
+@app.put("/users/me")
+async def update_current_user(
+    token: str = Form(...),
+    name: str = Form(...),
+    email: str = Form(...),
+    password: str = Form(None),
+    image: UploadFile = File(None),
+    db: Session = Depends(get_db)
+):
+    """
+    Update current user profile
+    Supports form data for name, email, optional password, and optional image
+    """
+    try:
+        # Extract user_id from token
+        user_id = int(token.replace("focustalk_token_", ""))
+        user = db.query(User).filter(User.id == user_id).first()
+        
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+        
+        # Check if email is being changed and if it's already taken
+        if email != user.email:
+            existing_user = db.query(User).filter(User.email == email).first()
+            if existing_user:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Email already taken by another user"
+                )
+        
+        # Update user fields
+        user.full_name = name
+        user.email = email
+        
+        # Update password if provided
+        if password and len(password.strip()) > 0:
+            if len(password) < 6:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Password must be at least 6 characters long"
+                )
+            user.password_hash = get_password_hash(password)
+        
+        # Handle profile image upload
+        if image and image.filename:
+            try:
+                # Create static/profile_images directory if it doesn't exist
+                upload_dir = Path("static/profile_images")
+                upload_dir.mkdir(parents=True, exist_ok=True)
+                
+                # Generate unique filename with timestamp
+                file_extension = Path(image.filename).suffix.lower()
+                # Validate file extension
+                allowed_extensions = ['.jpg', '.jpeg', '.png', '.gif', '.webp']
+                if file_extension not in allowed_extensions:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Invalid file type. Allowed: {', '.join(allowed_extensions)}"
+                    )
+                
+                new_filename = f"user_{user_id}_{int(time.time())}{file_extension}"
+                file_path = upload_dir / new_filename
+                
+                # Save the uploaded file
+                with open(file_path, "wb") as buffer:
+                    shutil.copyfileobj(image.file, buffer)
+                
+                # Update user picture URL (accessible via /static/profile_images/filename)
+                user.picture = f"/static/profile_images/{new_filename}"
+                logger.info(f"Profile image saved: {user.picture}")
+                
+            except HTTPException:
+                raise
+            except Exception as img_error:
+                logger.error(f"Error saving profile image: {img_error}")
+                # Don't fail the entire request if image upload fails
+                # Just log the error and continue with other updates
+        
+        db.commit()
+        db.refresh(user)
+        
+        return {
+            "success": True,
+            "message": "Profile updated successfully",
+            "name": user.full_name,
+            "email": user.email,
+            "picture": get_full_image_url(user.picture)
+        }
+        
+    except ValueError:
+        raise HTTPException(status_code=401, detail="Invalid token")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Update failed: {str(e)}")
+
+# ===========================
+# USER PROGRESS TRACKING
+# ===========================
+
+@app.post("/user/sync_progress")
+async def sync_progress(request: SyncProgressRequest, db: Session = Depends(get_db)):
+    """
+    Sync user quiz progress (solved count and streak)
+    """
+    try:
+        # Find user by email
+        user = db.query(User).filter(User.email == request.email).first()
+        
+        if not user:
+            raise HTTPException(
+                status_code=404,
+                detail="User not found"
+            )
+        
+        # Update solved count
+        user.solved_count += request.solved_increment
+        
+        # Update streak (frontend sends the new streak value)
+        user.streak = request.streak
+        
+        db.commit()
+        db.refresh(user)
+        
+        logger.info(f"✅ Progress synced for {request.email}: solved={user.solved_count}, streak={user.streak}")
+        
+        return {
+            "success": True,
+            "message": "Progress synced successfully",
+            "solved_count": user.solved_count,
+            "streak": user.streak
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Error syncing progress: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to sync progress: {str(e)}")
