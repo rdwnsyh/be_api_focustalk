@@ -30,20 +30,28 @@ pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto", bcrypt__rounds
 def get_password_hash(password: str) -> str:
     """
     bcrypt only supports passwords up to 72 bytes
+    Truncate password if longer than 72 bytes
     """
     password_bytes = password.encode("utf-8")
-
+    
+    # Truncate to 72 bytes if necessary (bcrypt limitation)
     if len(password_bytes) > 72:
-        raise HTTPException(
-            status_code=400,
-            detail="Password terlalu panjang (maksimal 72 byte)"
-        )
-
+        password_bytes = password_bytes[:72]
+        password = password_bytes.decode("utf-8", errors="ignore")
+    
     return pwd_context.hash(password)
 
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
-    """Verify a password against its hash"""
+    """
+    Verify a password against its hash
+    Truncate to 72 bytes to match hashing behavior
+    """
+    password_bytes = plain_password.encode("utf-8")
+    if len(password_bytes) > 72:
+        password_bytes = password_bytes[:72]
+        plain_password = password_bytes.decode("utf-8", errors="ignore")
+    
     return pwd_context.verify(plain_password, hashed_password)
 
 # ===========================
@@ -146,7 +154,7 @@ GOOGLE_CLIENT_ID = "383786989370-tegl1qqrjaj72u313k8tok1peojo9fao.apps.googleuse
 # HELPER FUNCTIONS
 # ===========================
 
-def get_full_image_url(picture_path: str, base_url: str = "http://192.168.1.10:8000") -> str:
+def get_full_image_url(picture_path: str, base_url: str = "http://10.200.8.206:8000") -> str:
     """
     Convert relative image path to full URL
     If picture_path is already a full URL (starts with http), return as is
@@ -510,3 +518,38 @@ async def sync_progress(request: SyncProgressRequest, db: Session = Depends(get_
     except Exception as e:
         logger.error(f"❌ Error syncing progress: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to sync progress: {str(e)}")
+
+@app.get("/leaderboard")
+async def get_leaderboard(db: Session = Depends(get_db)):
+    """
+    Get leaderboard with top users sorted by solved_count (descending) then streak (descending)
+    Returns: List of users with rank, name, email, picture, total_solved, current_streak
+    """
+    try:
+        # Query all users sorted by solved_count DESC, then streak DESC
+        users = db.query(User).order_by(
+            User.solved_count.desc(),
+            User.streak.desc()
+        ).all()
+        
+        # Build leaderboard response
+        leaderboard = []
+        for idx, user in enumerate(users, start=1):
+            leaderboard.append({
+                "rank": idx,
+                "name": user.full_name,
+                "email": user.email,
+                "picture": get_full_image_url(user.picture),
+                "total_solved": user.solved_count,
+                "current_streak": user.streak
+            })
+        
+        logger.info(f"✅ Leaderboard fetched: {len(leaderboard)} users")
+        
+        return {
+            "leaderboard": leaderboard
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ Error fetching leaderboard: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to fetch leaderboard: {str(e)}")
